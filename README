@@ -1,4 +1,8 @@
-## Raspberry Pi bareback LF/MF/HF/VHF WSPR transmitter
+## Raspberry Pi LF/MF/HF/VHF WSPR transmitter
+
+Use a WSPR-zero, TAPR.org or other low pass filter to clean up the noisy RF from the pi.
+
+GPIO Pin for Transmission: GPIO 4 (Physical Pin 7 on the Raspberry Pi Header)
 
 Makes a very simple WSPR beacon from your RasberryPi by connecting GPIO
 port to Antenna (and LPF), operates on LF, MF, HF and VHF bands from
@@ -7,7 +11,6 @@ port to Antenna (and LPF), operates on LF, MF, HF and VHF bands from
 Compatible with the original Raspberry Pi, the Raspberry Pi 2/3, and
 the Pi Zero.
 
-<<<<<<< HEAD
 ******
 Installation / update:
 ******
@@ -16,24 +19,14 @@ Installation / update:
 Some minor tweaks to fix compile errors on the latest Raspbery Pi OS as of July 2023 - Debian version: 11 (bullseye)
 
 ## Installation / update:
-  
->>>>>>> 67ebe39 (Readme updates)
+You can either just download and make a new WSPR-zero SD card or pull this repo and compile:
+
   Download and compile code:
-`    sudo apt-get install git
-`
-`    git clone https://github.com/JamesP6000/WsprryPi.git
+`    git clone https://github.com/zinkwazi/WsprryPi-zero.git
 `
 `    cd WsprryPi-zero
 `
 `    make
-`
-  Install to /usr/local/bin:
-`    sudo make install
-`
-
-  Uninstall:
-`    sudo make uninstall
-`
 
 ## Usage: 
 
