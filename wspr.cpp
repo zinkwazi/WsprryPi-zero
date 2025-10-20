@@ -1240,17 +1240,29 @@ void setup_peri_base_virt(
 }
 
 int main(const int argc, char * const argv[]) {
-  //catch all signals (like ctrl+c, ctrl+z, ...) to ensure DMA is disabled
-  for (int i = 0; i < 64; i++) {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
+  // Handle only the signals we actually want to treat as fatal,
+  // and ignore harmless ones like SIGWINCH (terminal resize).
+  {
+    struct sigaction sa{};
     sa.sa_handler = cleanupAndExit;
-    sigaction(i, &sa, NULL);
+    sa.sa_flags   = SA_RESTART;            // auto-restart interrupted syscalls
+
+    int catch_sigs[] = {
+      SIGHUP, SIGINT, SIGQUIT, SIGTERM,    // normal termination signals
+      SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT  // serious faults
+    };
+    for (int s : catch_sigs) sigaction(s, &sa, NULL);
+
+    // Ignore noisy/non-fatal signals
+    signal(SIGWINCH, SIG_IGN);   // terminal resized
+    signal(SIGPIPE,  SIG_IGN);   // broken pipe on stdout/stderr
+    signal(SIGCHLD,  SIG_IGN);   // child exits (if you ever spawn helpers)
   }
+
   atexit(cleanup);
   setSchedPriority(30);
-
-{
+  
+  {
   std::string model = detect_rpi_model();
   struct utsname un{};
   uname(&un);
@@ -1455,21 +1467,41 @@ int main(const int argc, char * const argv[]) {
         timeval_subtract(&tvDiff, &tvEnd, &tvBegin);
         printf(" (%ld.%03ld s)\n", tvDiff.tv_sec, (tvDiff.tv_usec + 500) / 1000);
 
-        // Auto-calibrate PWM clock for next frame
-	double T = tvDiff.tv_sec + tvDiff.tv_usec / 1e6;
-	double target = 162.0 * wspr_symtime;
-	if (T > 0.0 && std::isfinite(T)) {
-	  double err = (T - target) / target;       // relative error
-	  if (std::fabs(err) > 0.002) {             // only adjust if >0.2% off
-	    double factor = target / T;
-	    f_pwm_clk *= factor;
-	    std::cout << "  Calibrated f_pwm_clk (x"
-		      << std::setprecision(4) << factor
-		      << ") -> " << std::fixed << std::setprecision(2)
-		      << f_pwm_clk << std::endl;
-	    save_fclk(f_pwm_clk);
-	  }
-	}
+// Auto-calibrate PWM clock for next frame (with dead-band & damping)
+double T = tvDiff.tv_sec + tvDiff.tv_usec / 1e6;
+double target = 162.0 * wspr_symtime;  // 110.592 s for WSPR-2
+
+if (T > 0.0 && std::isfinite(T)) {
+  // err > 0: frame too long (we ran slow) -> increase f_pwm_clk
+  // err < 0: frame too short (we ran fast) -> decrease f_pwm_clk
+  const double err       = (T - target) / target;  // relative error
+  const double deadband  = 0.0015;                 // 0.15%: ignore tiny drift
+  const double kp        = 0.5;                    // apply 50% of needed correction
+  const double max_step  = 0.005;                  // clamp per-frame change to ±0.5%
+
+  if (std::fabs(err) > deadband) {
+    // step is the fractional change to apply to f_pwm_clk this frame
+    double step = std::clamp(-kp * err, -max_step, +max_step);
+
+    double prev = f_pwm_clk;
+    f_pwm_clk *= (1.0 + step);
+
+    // sanity clamp; adjust bounds if you like
+    f_pwm_clk = std::clamp(f_pwm_clk, 1e7, 1e9);
+
+    std::cout << "  Calibrated f_pwm_clk (err="
+              << std::showpos << std::setprecision(5) << err * 100
+              << "%, step=" << step * 100 << "%) -> "
+              << std::noshowpos << std::fixed << std::setprecision(2)
+              << f_pwm_clk << std::endl;
+
+    // persist only if it actually changed
+    if (std::fabs(f_pwm_clk - prev) / prev > 1e-6) {
+      save_fclk(f_pwm_clk);
+    }
+  }
+}
+
       } else {
         std::cout << "  Skipping transmission" << std::endl;
         usleep(1000000);
