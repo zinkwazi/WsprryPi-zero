@@ -44,6 +44,56 @@
 #include <algorithm>
 #include <pthread.h>
 #include <sys/timex.h>
+#include <fstream>
+#include <sys/utsname.h>
+#include <cstdio>
+#include <cerrno>
+#include <cstring>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+// Empirical value for F_PWM_CLK that produces WSPR symbols that are 'close' to
+// 0.682s long. For some reason, despite the use of DMA, the load on the PI
+// affects the TX length of the symbols. However, the varying symbol length is
+// compensated for in the main loop.
+// new for WSPR-zero (Zero 2 W / aarch64 tuned)
+#ifndef F_PWM_CLK_INIT
+#define F_PWM_CLK_INIT (653820983.07)  // use your latest stable
+#endif
+
+static const char* FCLK_DIR  = "/var/lib/wspr-zero";
+static const char* FCLK_PATH = "/var/lib/wspr-zero/f_pwm_clk";
+
+static void ensure_fclk_dir() {
+  // Create once; ignore EEXIST
+  if (mkdir(FCLK_DIR, 0755) == -1 && errno != EEXIST) {
+    // not fatal, but useful to log if you want:
+    // fprintf(stderr, "mkdir(%s): %s\n", FCLK_DIR, strerror(errno));
+  }
+}
+
+static double load_fclk_or_default() {
+  ensure_fclk_dir();
+  FILE* f = fopen(FCLK_PATH, "r");
+  if (!f) return F_PWM_CLK_INIT;
+  double v = 0.0;
+  if (fscanf(f, "%lf", &v) != 1 || !std::isfinite(v) || v < 1e6 || v > 1e9) v = F_PWM_CLK_INIT;
+  fclose(f);
+  return v;
+}
+
+static void save_fclk(double v) {
+  ensure_fclk_dir();
+  const char* tmp = "/var/lib/wspr-zero/f_pwm_clk.tmp";
+  FILE* f = fopen(tmp, "w");
+  if (!f) return;
+  fprintf(f, "%.2f\n", v);
+  fflush(f);
+  fsync(fileno(f));
+  fclose(f);
+  rename(tmp, FCLK_PATH); // atomic replace
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,11 +169,6 @@ extern "C" {
 #error "RPI version macro is not defined"
 #endif
 #endif
-// Empirical value for F_PWM_CLK that produces WSPR symbols that are 'close' to
-// 0.682s long. For some reason, despite the use of DMA, the load on the PI
-// affects the TX length of the symbols. However, the varying symbol length is
-// compensated for in the main loop.
-#define F_PWM_CLK_INIT (31156186.6125761)
 
 // WSRP nominal symbol time
 #define WSPR_SYMTIME (8192.0/12000.0)
@@ -176,6 +221,31 @@ volatile unsigned *peri_base_virt = NULL;
 #define CLK_BUS_BASE (0x7E101000)
 #define DMA_BUS_BASE (0x7E007000)
 #define PWM_BUS_BASE  (0x7e20C000) /* PWM controller */
+
+// --- Simple GPIO helpers for an LED ---
+#ifndef LED_PIN
+#define LED_PIN 18            // BCM numbering (physical pin 12)
+#endif
+static bool g_led_init = false;
+
+static inline void gpio_fsel_output(unsigned pin) {
+  unsigned reg   = GPIO_BUS_BASE + 0x00 + (pin/10)*4;   // GPFSELn
+  unsigned shift = (pin % 10) * 3;
+  unsigned v = ACCESS_BUS_ADDR(reg);
+  v &= ~(7u << shift);   // clear function
+  v |=  (1u << shift);   // set to 001 (output)
+  ACCESS_BUS_ADDR(reg) = v;
+}
+
+static inline void gpio_set(unsigned pin) {
+  unsigned reg = GPIO_BUS_BASE + 0x1C + (pin/32)*4;     // GPSETn
+  ACCESS_BUS_ADDR(reg) = 1u << (pin % 32);
+}
+
+static inline void gpio_clr(unsigned pin) {
+  unsigned reg = GPIO_BUS_BASE + 0x28 + (pin/32)*4;     // GPCLRn
+  ACCESS_BUS_ADDR(reg) = 1u << (pin % 32);
+}
 
 // Convert from a bus address to a physical address.
 #define BUS_TO_PHYS(x) ((x)&~0xC0000000)
@@ -262,8 +332,8 @@ void getRealMemPageFromPool(void ** vAddr, void **bAddr) {
     ABORT(-1);
   }
   unsigned offset = mbox.pool_cnt*4096;
-  *vAddr = (void*)(((unsigned)mbox.virt_addr) + offset);
-  *bAddr = (void*)(((unsigned)mbox.bus_addr) + offset);
+  *vAddr = (void*)(mbox.virt_addr + offset);                 // pointer math on unsigned char*
+  *bAddr = (void*)((uintptr_t)mbox.bus_addr + offset);       // widen to pointer-sized int first
   //printf("getRealMemoryPageFromPool bus_addr=%x virt_addr=%x\n", (unsigned)*pAddr,(unsigned)*vAddr);
   mbox.pool_cnt++;
 }
@@ -327,6 +397,9 @@ void txon() {
   //ACCESS_BUS_ADDR(PADS_GPIO_0_27_BUS) = 0x5a000018 + 5;  //12mA +9.2dBm
   //ACCESS_BUS_ADDR(PADS_GPIO_0_27_BUS) = 0x5a000018 + 6;  //14mA +10.0dBm
   ACCESS_BUS_ADDR(PADS_GPIO_0_27_BUS) = 0x5a000018 + 7;  //16mA +10.6dBm
+  // TX LED ON
+  if (!g_led_init) { gpio_fsel_output(LED_PIN); g_led_init = true; }
+  gpio_set(LED_PIN);
 
   disable_clock();
 
@@ -342,6 +415,8 @@ void txon() {
 void txoff() {
   //struct GPCTL setupword = {6/*SRC*/, 0, 0, 0, 0, 1,0x5a};
   //ACCESS_BUS_ADDR(CM_GP0CTL_BUS) = *((int*)&setupword);
+  // TX LED OFF
+  if (g_led_init) gpio_clr(LED_PIN);
   disable_clock();
 }
 
@@ -583,6 +658,53 @@ void to_upper(
     *str = toupper(*str);
     str++;
   }
+}
+// Detect the CPU and Raspberry Pi version
+static std::string read_file_trim(const char* path) {
+  std::ifstream f(path, std::ios::in | std::ios::binary);
+  if (!f) return "";
+  std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  while (!s.empty() && (s.back()=='\0' || s.back()=='\n' || s.back()=='\r' || s.back()==' ' || s.back()=='\t')) s.pop_back();
+  return s;
+}
+
+static std::string detect_rpi_model() {
+  const char* paths[] = { "/proc/device-tree/model", "/sys/firmware/devicetree/base/model", nullptr };
+  for (int i=0; paths[i]; ++i) {
+    auto s = read_file_trim(paths[i]);
+    if (!s.empty()) return s;
+  }
+  // Fallback: /proc/cpuinfo
+  std::ifstream f("/proc/cpuinfo");
+  if (f) {
+    std::string line;
+    while (std::getline(f, line)) {
+      if (line.rfind("Model", 0) == 0) {
+        auto pos = line.find(':');
+        if (pos != std::string::npos) {
+          std::string s = line.substr(pos+1);
+          // trim leading spaces
+          s.erase(0, s.find_first_not_of(" \t"));
+          return s;
+        }
+      }
+    }
+  }
+  return "Raspberry Pi (model unknown)";
+}
+
+static const char* userland_bits() {
+  return (sizeof(void*) == 8) ? "64-bit" : "32-bit";
+}
+
+static const char* userland_arch() {
+#if defined(__aarch64__)
+  return "aarch64";
+#elif defined(__arm__)
+  return "arm";
+#else
+  return "unknown";
+#endif
 }
 
 // Encode call, locator, and dBm into WSPR codeblock.
@@ -1128,18 +1250,20 @@ int main(const int argc, char * const argv[]) {
   atexit(cleanup);
   setSchedPriority(30);
 
-#ifdef RPI1
-  std::cout << "Detected Raspberry Pi version 1" << std::endl;
-#else
-#ifdef RPI23
-  std::cout << "Detected Raspberry Pi version 2/3" << std::endl;
-#else
-#error "RPI version macro is not defined"
-#endif
-#endif
+{
+  std::string model = detect_rpi_model();
+  struct utsname un{};
+  uname(&un);
+  std::cout << "Detected: " << model
+            << " • userland " << userland_bits() << " (" << userland_arch() << ")"
+            << " • kernel " << un.machine
+            << std::endl;
+}
 
   // Initialize the RNG
   srand(time(NULL));
+
+  double f_pwm_clk = load_fclk_or_default();  // restore last good value (or default)
 
   // Parse arguments
   std::string callsign;
@@ -1177,6 +1301,10 @@ int main(const int argc, char * const argv[]) {
   struct PageInfo instrPage;
   struct PageInfo instrs[1024];
   setup_peri_base_virt(peri_base_virt);
+  gpio_fsel_output(LED_PIN);
+  gpio_clr(LED_PIN);     // LED off initially
+  g_led_init = true;
+
   // Set up DMA
   open_mbox();
   txon();
@@ -1217,7 +1345,7 @@ int main(const int argc, char * const argv[]) {
         }
         ppm_prev=ppm;
       }
-      txSym(0, center_freq_actual, tone_spacing, 60, dma_table_freq, F_PWM_CLK_INIT, instrs, constPage, bufPtr);
+      txSym(0, center_freq_actual, tone_spacing, 60, dma_table_freq, f_pwm_clk, instrs, constPage, bufPtr);
     }
 
     // Should never get here...
@@ -1301,30 +1429,47 @@ int main(const int argc, char * const argv[]) {
         int bufPtr=0;
         txon();
         for (int i = 0; i < 162; i++) {
-          gettimeofday(&sym_start,NULL);
+          gettimeofday(&sym_start, NULL);
           timeval_subtract(&diff, &sym_start, &tvBegin);
-          double elapsed=diff.tv_sec+diff.tv_usec/1e6;
-          //elapsed=(i)*wspr_symtime;
-          double sched_end=(i+1)*wspr_symtime;
-          //cout << "symbol " << i << " " << wspr_symtime << std::endl;
-          //cout << sched_end-elapsed << std::endl;
-          double this_sym=sched_end-elapsed;
-          this_sym=(this_sym<.2)?.2:this_sym;
-          this_sym=(this_sym>2*wspr_symtime)?2*wspr_symtime:this_sym;
-          txSym(symbols[i], center_freq_actual, tone_spacing, sched_end-elapsed, dma_table_freq, F_PWM_CLK_INIT, instrs, constPage, bufPtr);
+
+          // schedule-aligned symbol duration (no floor; allow catch-up)
+          double elapsed   = diff.tv_sec + diff.tv_usec / 1e6;
+          double sched_end = (i + 1) * wspr_symtime;
+          double this_sym  = sched_end - elapsed;
+          if (this_sym < 0.0) this_sym = 0.0;                       // allow catch-up
+          double max_sym = 2.0 * wspr_symtime;                      // keep a sane ceiling
+          if (this_sym > max_sym) this_sym = max_sym;
+
+          txSym(symbols[i], center_freq_actual, tone_spacing, this_sym,
+                dma_table_freq, f_pwm_clk, instrs, constPage, bufPtr);
         }
         n_tx++;
 
         // Turn transmitter off
         txoff();
 
-        // End timestamp
+        // End timestamp + duration
         gettimeofday(&tvEnd, NULL);
         std::cout << "  TX ended at:   ";
         timeval_print(&tvEnd);
         timeval_subtract(&tvDiff, &tvEnd, &tvBegin);
-        printf(" (%ld.%03ld s)\n", tvDiff.tv_sec, (tvDiff.tv_usec+500)/1000);
+        printf(" (%ld.%03ld s)\n", tvDiff.tv_sec, (tvDiff.tv_usec + 500) / 1000);
 
+        // Auto-calibrate PWM clock for next frame
+	double T = tvDiff.tv_sec + tvDiff.tv_usec / 1e6;
+	double target = 162.0 * wspr_symtime;
+	if (T > 0.0 && std::isfinite(T)) {
+	  double err = (T - target) / target;       // relative error
+	  if (std::fabs(err) > 0.002) {             // only adjust if >0.2% off
+	    double factor = target / T;
+	    f_pwm_clk *= factor;
+	    std::cout << "  Calibrated f_pwm_clk (x"
+		      << std::setprecision(4) << factor
+		      << ") -> " << std::fixed << std::setprecision(2)
+		      << f_pwm_clk << std::endl;
+	    save_fclk(f_pwm_clk);
+	  }
+	}
       } else {
         std::cout << "  Skipping transmission" << std::endl;
         usleep(1000000);
