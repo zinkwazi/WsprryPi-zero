@@ -1406,9 +1406,9 @@ int main(const int argc, char * const argv[]) {
 
       // Wait for WSPR transmission window to arrive.
       if (no_delay) {
-        std::cout << "  Transmitting immediately (not waiting for WSPR window)" << std::endl;
+        std::cout << "  WSPR-zero transmitting immediately (not waiting for WSPR window)" << std::endl;
       } else {
-        std::cout << "  Waiting for next WSPR transmission window..." << std::endl;
+        std::cout << "  WSPR-zero waiting for next WSPR transmission window..." << std::endl;
         wait_every((wspr15) ? 15 : 2);
       }
 
@@ -1493,7 +1493,7 @@ if (T > 0.0 && std::isfinite(T)) {
               << std::showpos << std::setprecision(5) << err * 100
               << "%, step=" << step * 100 << "%) -> "
               << std::noshowpos << std::fixed << std::setprecision(2)
-              << f_pwm_clk << std::endl;
+              << f_pwm_clk << std::endl << std::endl;
 
     // persist only if it actually changed
     if (std::fabs(f_pwm_clk - prev) / prev > 1e-6) {
